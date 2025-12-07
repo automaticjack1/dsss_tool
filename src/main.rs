@@ -612,12 +612,33 @@ impl DsssDecoder {
         }
 
         let payload_chips = &chips[start..];
+
+        // snap to full symbols
         let n = self.config.spreading_factor;
         let usable_len = (payload_chips.len() / n) * n;
         let payload_chips = &payload_chips[..usable_len];
 
         let bytes = self.decode_from_chips(payload_chips);
-        Some(bytes)
+        if bytes.len() < 4 {
+            eprintln!("[decode] too few bytes for length header");
+            return None;
+        }
+
+        let len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        if bytes.len() < 4 + len {
+            eprintln!(
+                "[decode] declared length {} but only {} bytes available",
+                len,
+                bytes.len().saturating_sub(4)
+            );
+            // You can either treat this as error, or return whatever you have:
+            // return None;
+        }
+
+        let end = (4 + len).min(bytes.len());
+        let msg = bytes[4..end].to_vec();
+
+        Some(msg)
     }
 }
 
@@ -819,9 +840,16 @@ fn main() {
         //--------------------------------------------------
         // 6. Build one DSSS frame (preamble + payload bits)
         //--------------------------------------------------
-        let mut frame_bits = Vec::with_capacity(PREAMBLE_BITS.len() + payload.len() * 8);
+        let payload_len = payload.len() as u32;
+        let mut frame_bytes = Vec::with_capacity(4 + payload.len());
+        frame_bytes.extend_from_slice(&payload_len.to_be_bytes());
+        frame_bytes.extend_from_slice(&payload);
+
+        let mut frame_bits = Vec::with_capacity(
+            PREAMBLE_BITS.len() + frame_bytes.len() * 8
+        );
         frame_bits.extend_from_slice(PREAMBLE_BITS);
-        frame_bits.extend(bytes_to_bits(&payload));
+        frame_bits.extend(bytes_to_bits(&frame_bytes));
 
         let frame_chips = bits_to_chips(&frame_bits, &config);
         let frame = chips_to_passband(&frame_chips, &config);

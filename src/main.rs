@@ -3,18 +3,24 @@ use hound::{WavReader, WavWriter, WavSpec, SampleFormat};
 use image::{GrayImage, Luma};
 use rand_chacha::ChaCha12Rng;
 use rand::{Rng, SeedableRng};
+use reed_solomon::{Encoder, Decoder};
 use rustfft::{FftPlanner, num_complex::Complex32};
 use std::f32::consts::PI;
 use std::fs::File;
 use std::io::{Read, Write};
 
-type StereoSample = [f32; 2];
+// Near top of main.rs
+const RS_DATA_LEN: usize = 64;   // data bytes per codeword
+const RS_ECC_LEN: usize  = 191;    // parity bytes
+const RS_CODEWORD_LEN: usize = RS_DATA_LEN + RS_ECC_LEN; // 255
 
 // Example: fixed preamble bits (Barker-like or just pseudo-random)
 const PREAMBLE_BITS: &[u8] = &[
     1,0,1,1,0,1,0,0,  1,1,0,0,1,0,1,1,
     0,1,0,1,1,0,0,1,  1,0,1,0,0,1,1,0,
 ];
+
+type StereoSample = [f32; 2];
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 enum Mode {
@@ -85,15 +91,116 @@ struct Args {
     channel: Channel,
 }
 
-fn bits_to_chips(bits: &[u8], cfg: &DsssConfig) -> Vec<f32> {
-    let mut chips = Vec::with_capacity(bits.len() * cfg.spreading_factor);
-    for &bit in bits {
-        let bit_val = if bit == 1 { 1.0 } else { -1.0 };
-        for j in 0..cfg.spreading_factor {
-            let code_val = cfg.prn_code[j % cfg.prn_code.len()] as f32;
-            chips.push(bit_val * code_val);
+/// Choose the chip stream (cos, sin, -cos, -sin) with strongest correlation
+/// against the known preamble.
+fn select_best_chip_stream(chip_sets: &[Vec<f32>;4], preamble: &[f32]) -> Vec<f32> {
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best: Option<&Vec<f32>> = None;
+
+    for chips in chip_sets {
+        if chips.len() < preamble.len() { continue; }
+
+        let mut score = 0.0;
+        for i in 0..preamble.len() {
+            score += chips[i] * preamble[i];
+        }
+
+        if score.abs() > best_score {
+            best_score = score.abs();
+            best = Some(chips);
         }
     }
+
+    best.unwrap().clone()
+}
+
+fn sinc(x: f32) -> f32 {
+    if x.abs() < 1e-8 {
+        1.0
+    } else {
+        (std::f32::consts::PI * x).sin() / (std::f32::consts::PI * x)
+    }
+}
+
+fn design_bandpass_fir(
+    sample_rate: f32,
+    center_freq: f32,
+    chip_rate: f32,
+    taps: usize,
+) -> Vec<f32> {
+    let nyquist = sample_rate * 0.5;
+
+    // Narrower bandwidth: ~1.0 * chip_rate (trades a bit of DSSS energy for better SNR)
+    let mut half_bw = 0.5 * chip_rate; // you can experiment: 0.5, 0.75, 1.0
+    if half_bw > 0.9 * nyquist {
+        half_bw = 0.9 * nyquist;
+    }
+
+    let f1 = (center_freq - half_bw).max(0.0);
+    let f2 = (center_freq + half_bw).min(nyquist);
+
+    let fc1 = f1 / sample_rate; // normalized (0..0.5)
+    let fc2 = f2 / sample_rate;
+
+    let m = (taps - 1) as f32 / 2.0;
+    let mut h = vec![0.0f32; taps];
+
+    for n in 0..taps {
+        let k = n as f32 - m;
+        // Ideal bandpass = (lowpass at fc2) - (lowpass at fc1)
+        let lp2 = 2.0 * fc2 * sinc(2.0 * fc2 * k);
+        let lp1 = 2.0 * fc1 * sinc(2.0 * fc1 * k);
+        let ideal = lp2 - lp1;
+
+        // Hamming window
+        let w = 0.54 - 0.46 * (2.0 * std::f32::consts::PI * n as f32 / (taps - 1) as f32).cos();
+
+        h[n] = ideal * w;
+    }
+
+    // Normalize to unit L1 gain; absolute scale isn’t critical since demod is relative,
+    // but this keeps values reasonable.
+    let sum: f32 = h.iter().sum();
+    if sum.abs() > 1e-8 {
+        for v in &mut h {
+            *v /= sum;
+        }
+    }
+
+    h
+}
+
+fn apply_fir(input: &[f32], h: &[f32]) -> Vec<f32> {
+    let n = input.len();
+    let m = h.len();
+    let mut out = vec![0.0f32; n];
+
+    for i in 0..n {
+        let mut acc = 0.0;
+        let mut k = 0usize;
+        while k < m && k <= i {
+            acc += input[i - k] * h[k];
+            k += 1;
+        }
+        out[i] = acc;
+    }
+
+    out
+}
+
+fn bits_to_chips(bits: &[u8], cfg: &DsssConfig) -> Vec<f32> {
+    let sf = cfg.spreading_factor;
+    let prn = &cfg.prn_code;
+    let mut chips = Vec::with_capacity(bits.len() * sf);
+
+    for &b in bits {
+        let symbol = if b == 0 { -1.0 } else { 1.0 };
+        for j in 0..sf {
+            let pn = prn[j % prn.len()] as f32;
+            chips.push(symbol * pn);
+        }
+    }
+
     chips
 }
 
@@ -127,33 +234,55 @@ fn preamble_chips(cfg: &DsssConfig) -> Vec<f32> {
 /// Find chip offset of preamble in `chips` using sliding correlation.
 /// Returns Some(offset) if found, else None.
 fn acquire_preamble_offset(
-    preamble_chips: &[f32],
+    pre_chips: &[f32],
     chips: &[f32],
     max_search: usize,
 ) -> Option<usize> {
-    let n_p = preamble_chips.len();
-    if n_p == 0 || chips.len() < n_p {
+    let n = pre_chips.len();
+    if n == 0 || chips.len() < n {
         return None;
     }
 
-    let limit = chips.len().saturating_sub(n_p).min(max_search);
+    // We’ll search up to this many starting positions.
+    //let max_pos = chips.len().saturating_sub(n).min(max_search);
+    let max_pos = max_search.min(chips.len().saturating_sub(n));
 
-    let mut best_offset = None;
-    let mut best_metric = 0.0_f32;
+    // Energy of the preamble (for ±1 chips this is just n, but we’ll compute it)
+    let pre_energy: f32 = pre_chips.iter().map(|x| x * x).sum();
 
-    for k in 0..=limit {
-        let mut acc = 0.0_f32;
-        for i in 0..n_p {
-            acc += chips[k + i] * preamble_chips[i];
+    let mut best_idx: usize = 0;
+    let mut best_score: f32 = f32::NEG_INFINITY;
+
+    for start in 0..=max_pos {
+        let mut acc = 0.0f32;
+        // Correlate pre_chips with chips[start .. start+n]
+        for i in 0..n {
+            acc += pre_chips[i] * chips[start + i];
         }
-        let metric = acc.abs();
-        if metric > best_metric {
-            best_metric = metric;
-            best_offset = Some(k);
+        if acc > best_score {
+            best_score = acc;
+            best_idx = start;
         }
     }
 
-    best_offset
+    // Require a strong match; anything below this is treated as "no preamble".
+    // For a clean match, best_score ≈ pre_energy (~n). Random junk is << pre_energy.
+    //let threshold = 0.7 * pre_energy;
+    let threshold = 0.25 * pre_energy;
+
+    if best_score < threshold {
+        eprintln!(
+            "[decode] no strong preamble found: best_score={} threshold={} (energy={})",
+            best_score, threshold, pre_energy
+        );
+        None
+    } else {
+        println!(
+            "[decode] preamble peak at chip offset {} with score {} (energy={})",
+            best_idx, best_score, pre_energy
+        );
+        Some(best_idx)
+    }
 }
 
 /// Compute a spectrogram (waterfall) of mono samples and save to a PNG.
@@ -530,115 +659,290 @@ impl DsssDecoder {
             "chip stream length must be multiple of spreading_factor"
         );
 
-        let mut bits = Vec::with_capacity(chips.len() / n);
+	let prn = &self.config.prn_code;
+	let n_bits = chips.len() / n;
+	let mut bits = Vec::with_capacity(n_bits);
 
-        for symbol_chips in chips.chunks(n) {
-            let mut acc = 0.0_f32;
-            for (j, &chip) in symbol_chips.iter().enumerate() {
-                let code_val = self.config.prn_code[j % self.config.prn_code.len()] as f32;
-                acc += chip * code_val;
+	for bit_idx in 0..n_bits {
+            let mut acc = 0.0;
+            for k in 0..n {
+		let chip = chips[bit_idx * n + k];
+		let pn   = prn[k % prn.len()] as f32; // +1 / -1
+		acc += chip * pn;
             }
+            bits.push(if acc >= 0.0 { 1u8 } else { 0u8 });
+	}
+	
+	Self::bits_to_bytes(&bits)
+    }
 
-            let bit = if acc >= 0.0 { 1 } else { 0 };
-            bits.push(bit);
-        }
-
-        bits_to_bytes(&bits)
+    fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+	let mut out = Vec::with_capacity((bits.len() + 7) / 8);
+	let mut byte = 0u8;
+	for (i, &b) in bits.iter().enumerate() {
+            byte = (byte << 1) | (b & 1);
+            if i % 8 == 7 {
+		out.push(byte);
+		byte = 0;
+            }
+	}
+	let rem = bits.len() % 8;
+	if rem != 0 {
+            byte <<= 8 - rem;
+            out.push(byte);
+	}
+	out
     }
 
     /// Demodulate passband samples back down to DSSS chips (baseband).
-    ///
-    /// This performs a coherent demodulation against the configured carrier and
-    /// integrates over each chip interval. Any trailing partial chip is ignored.
-    pub fn demodulate_to_chips(&self, samples: &[f32]) -> Vec<f32> {
-        let spc = self.config.samples_per_chip;
-        let sample_rate = self.config.sample_rate();
-        let dt = 1.0_f32 / sample_rate;
-        let omega_c = 2.0_f32 * PI * self.config.carrier_freq;
+    /// Fully noncoherent demodulation.
+    /// Returns a Vec of 4 chip sequences:
+    /// [chips_cos, chips_sin, chips_neg_cos, chips_neg_sin]
+    pub fn demodulate_to_chips_nco(&self, samples: &[f32]) -> [Vec<f32>; 4] {
+	let spc = self.config.samples_per_chip;
+	let sample_rate = self.config.sample_rate();
+	let dt = 1.0_f32 / sample_rate;
+	let omega_c = 2.0_f32 * PI * self.config.carrier_freq;
 
-        let mut chips = Vec::with_capacity(samples.len() / spc.max(1));
+	let mut chips_cos      = Vec::with_capacity(samples.len() / spc.max(1));
+	let mut chips_sin      = Vec::with_capacity(samples.len() / spc.max(1));
+	let mut chips_negcos   = Vec::with_capacity(samples.len() / spc.max(1));
+	let mut chips_negsin   = Vec::with_capacity(samples.len() / spc.max(1));
 
-        // Coherent demod: multiply by cos(ωc t) and integrate over each chip.
-        let mut t0 = 0.0_f32;
-        for chip_samples in samples.chunks(spc) {
-            if chip_samples.len() < spc {
-                break; // drop any partial chip at the end
-            }
+	let mut t0 = 0.0_f32;
 
-            let mut acc = 0.0_f32;
+	for chip_samples in samples.chunks(spc) {
+            if chip_samples.len() < spc { break; }
+
+            let mut acc_cos = 0.0_f32;
+            let mut acc_sin = 0.0_f32;
+
             for (i, &s) in chip_samples.iter().enumerate() {
-                let t = t0 + (i as f32) * dt;
-                let carrier = (omega_c * t).cos();
-                acc += s * carrier;
+		let t = t0 + (i as f32) * dt;
+		let c =  (omega_c * t).cos();
+		let q =  (omega_c * t).sin();
+		acc_cos += s * c;
+		acc_sin += s * q;
             }
+
+            chips_cos.push(     acc_cos);
+            chips_sin.push(     acc_sin);
+            chips_negcos.push( -acc_cos);
+            chips_negsin.push( -acc_sin);
 
             t0 += (spc as f32) * dt;
-            chips.push(acc);
-        }
+	}
 
-        chips
+	[chips_cos, chips_sin, chips_negcos, chips_negsin]
     }
 
-    /// Decode from a real passband signal at the configured carrier frequency,
-    /// assuming chip timing is already aligned.
-    pub fn decode_from_passband(&self, samples: &[f32]) -> Vec<u8> {
-        let chips = self.demodulate_to_chips(samples);
-        self.decode_from_chips(&chips)
+    /// Decode from a real passband signal assuming chip timing is
+    /// already aligned.
+    /// Fully noncoherent: select best of the four demod streams.
+    pub fn decode_from_passband_no_preamble(&self, samples: &[f32]) -> Vec<u8> {
+	// 1. Demodulate into 4 chip streams
+	let chip_sets = self.demodulate_to_chips_nco(samples);
+
+	// 2. Build preamble chips for matching
+	let pre = preamble_chips(&self.config);
+
+	// 3. Select the strongest of the four streams
+	let chips = select_best_chip_stream(&chip_sets, &pre);
+
+	// ------- Now 'chips' is Vec<f32> — just like before ---------
+
+	let chips_per_bit = self.config.spreading_factor;
+	let codeword_bits = RS_CODEWORD_LEN * 8;
+
+	let needed_chips = (codeword_bits + PREAMBLE_BITS.len()) * chips_per_bit;
+
+	if chips.len() < needed_chips {
+            println!(
+		"[debug] not enough chips: have {}, need {}",
+		chips.len(),
+		needed_chips
+            );
+	}
+
+	// Assume frame starts at chip 0
+	let start = PREAMBLE_BITS.len() * chips_per_bit;
+	let end = start + codeword_bits * chips_per_bit;
+
+	if end > chips.len() {
+            println!("[debug] truncated chips: requested {}..{}", start, end);
+	}
+
+	let end_clamped = end.min(chips.len());
+
+	let payload_chips = &chips[start..end_clamped];
+
+	self.decode_from_chips(payload_chips)
     }
 
     /// Decode from passband using a sliding-window correlator against the known
     /// preamble. This can acquire timing even if the stream starts at an
     /// arbitrary position, e.g., after clipping.
-    pub fn decode_from_passband_with_preamble(&self, samples: &[f32]) -> Option<Vec<u8>> {
-        let chips = self.demodulate_to_chips(samples);
-        let pre_chips = preamble_chips(&self.config);
+    pub fn decode_from_passband_with_preamble(&self, samples: &[f32], taps:usize) -> Option<Vec<u8>> {
+	// 1. Passband -> chips
+	let chip_sets = self.demodulate_to_chips_nco(samples);
+	let pre = preamble_chips(&self.config);
+	let chips = select_best_chip_stream(&chip_sets, &pre);
 
-        if chips.len() < pre_chips.len() {
+	// 2. Known preamble
+	let pre_chips = preamble_chips(&self.config);
+	if chips.len() < pre_chips.len() {
+            eprintln!("[decode] not enough chips for preamble");
             return None;
-        }
+	}
 
-        let max_search = chips.len().saturating_sub(pre_chips.len());
-        let offset = acquire_preamble_offset(&pre_chips, &chips, max_search)?;
+	// 3. Sliding-window acquisition
+	    //
+	// In EMBED mode we always start the frame at t=0 in the audio, so the
+	// preamble should be within a small window after the start (plus FIR
+	// group delay). To avoid locking on spurious peaks later, restrict the
+	// search region.
+	let fir_group_delay_samples = taps / 2; // == 128 for taps = 257
+	let fir_group_delay_chips = fir_group_delay_samples / self.config.samples_per_chip;
 
-        println!(
+	// e.g. search up to 4 preamble-lengths beyond the expected position
+	let small_search = pre_chips.len() * 4 + fir_group_delay_chips;
+	//let max_search = chips.len().saturating_sub(pre_chips.len());
+
+	let offset = acquire_preamble_offset(&pre_chips, &chips, small_search)?;
+	println!(
             "[decode] acquired preamble at chip offset {} (of {})",
             offset,
             chips.len()
-        );
+	);
 
-        let start = offset + pre_chips.len();
-        if start >= chips.len() {
+	// 4. Only decode one RS codeword: RS_CODEWORD_LEN bytes → RS_CODEWORD_LEN * 8 bits
+	let chips_per_bit = self.config.spreading_factor;
+
+	// raw chip index just after the preamble
+	let start = offset + pre_chips.len();
+
+	println!(
+	    "[decode] len(chips) = {}, offset = {}, pre_chips.len() = {}, start = {}",
+	    chips.len(),
+	    offset,
+	    pre_chips.len(),
+	    start
+	);
+	
+	if start >= chips.len() {
+            eprintln!("[decode] no chips after preamble");
             return None;
-        }
+	}
 
-        let payload_chips = &chips[start..];
+	let codeword_bits = RS_CODEWORD_LEN * 8;
+	let min_needed_chips = start + codeword_bits * chips_per_bit;
 
-        // snap to full symbols
-        let n = self.config.spreading_factor;
-        let usable_len = (payload_chips.len() / n) * n;
-        let payload_chips = &payload_chips[..usable_len];
-
-        let bytes = self.decode_from_chips(payload_chips);
-        if bytes.len() < 4 {
-            eprintln!("[decode] too few bytes for length header");
-            return None;
-        }
-
-        let len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        if bytes.len() < 4 + len {
+	if chips.len() < min_needed_chips {
             eprintln!(
-                "[decode] declared length {} but only {} bytes available",
-                len,
-                bytes.len().saturating_sub(4)
+		"[decode] warning: only {} chips after preamble, need {} for full RS codeword",
+		chips.len() - start,
+		codeword_bits * chips_per_bit
             );
-            // You can either treat this as error, or return whatever you have:
-            // return None;
-        }
+	}
 
-        let end = (4 + len).min(bytes.len());
-        let msg = bytes[4..end].to_vec();
+	let bits_available = (chips.len() - start) / chips_per_bit;
+	let bits_to_decode = bits_available.min(codeword_bits);
 
-        Some(msg)
+	if bits_to_decode < codeword_bits {
+            eprintln!(
+		"[decode] warning: only {} bits available, expected {}; frame truncated",
+		bits_to_decode, codeword_bits
+            );
+	}
+
+	let chips_to_decode = bits_to_decode * chips_per_bit;
+	let payload_chips = &chips[start..start + chips_to_decode];
+
+	// 5. Despread to bits/bytes
+	let bytes = self.decode_from_chips(payload_chips);
+	if bytes.len() < RS_CODEWORD_LEN {
+            eprintln!(
+		"[decode] only {} bytes recovered, expected {}; aborting",
+		bytes.len(),
+		RS_CODEWORD_LEN
+            );
+            return None;
+	}
+
+	println!(
+	    "[debug] pre-RS first 32 bytes: {:02X?}",
+	    &bytes[..32.min(bytes.len())]
+	);
+
+	// TEMP: compare against known transmitted codeword if available
+	if let Ok(tx_cw) = std::fs::read("tx_codeword.bin") {
+	    if tx_cw.len() == RS_CODEWORD_LEN {
+		let mut byte_errors = 0usize;
+		let mut bit_errors  = 0usize;
+
+		for i in 0..RS_CODEWORD_LEN {
+		    if tx_cw[i] != bytes[i] {
+			byte_errors += 1;
+			bit_errors += (tx_cw[i] ^ bytes[i]).count_ones() as usize;
+		    }
+		}
+
+		println!(
+		    "[debug] codeword mismatch: {} / {} bytes wrong, ~{} bits wrong",
+		    byte_errors,
+		    RS_CODEWORD_LEN,
+		    bit_errors
+		);
+	    } else {
+		println!(
+		    "[debug] tx_codeword.bin len {} != RS_CODEWORD_LEN {}",
+		    tx_cw.len(),
+		    RS_CODEWORD_LEN
+		);
+	    }
+	}
+
+	// Take first RS_CODEWORD_LEN bytes as RS codeword
+	let mut codeword = [0u8; RS_CODEWORD_LEN];
+	codeword.copy_from_slice(&bytes[..RS_CODEWORD_LEN]);
+
+	// 6. RS decode
+	let dec = Decoder::new(RS_ECC_LEN);
+	let mut buf = codeword;
+	let recovered = match dec.correct(&mut buf, None) {
+            Ok(r) => r,
+            Err(e) => {
+		eprintln!("[decode] RS decode failed: {:?}", e);
+		return None;
+            }
+	};
+
+	let data = recovered.data(); // &[u8], length RS_DATA_LEN
+	if data.len() < 4 {
+            eprintln!("[decode] RS data too short for length header");
+            return None;
+	}
+
+	let payload_len = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
+	if payload_len > RS_DATA_LEN - 4 {
+            eprintln!(
+		"[decode] absurd payload length {} (max {})",
+		payload_len,
+		RS_DATA_LEN - 4
+            );
+            return None;
+	}
+
+	if data.len() < 4 + payload_len {
+            eprintln!(
+		"[decode] RS data too short for declared payload length {}",
+		payload_len
+            );
+            return None;
+	}
+
+	let payload = &data[4..4 + payload_len];
+	Some(payload.to_vec())
     }
 }
 
@@ -653,28 +957,10 @@ fn bytes_to_bits(data: &[u8]) -> Vec<u8> {
     bits
 }
 
-/// Utility: convert bits (MSB-first) back to bytes.
-fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity((bits.len() + 7) / 8);
-    let mut current_byte = 0u8;
-    for (i, &bit) in bits.iter().enumerate() {
-        current_byte = (current_byte << 1) | (bit & 1);
-        if i % 8 == 7 {
-            bytes.push(current_byte);
-            current_byte = 0;
-        }
-    }
-    let rem = bits.len() % 8;
-    if rem != 0 {
-        let shift = 8 - rem;
-        bytes.push(current_byte << shift);
-    }
-    bytes
-}
-
 fn main() {
     let args = Args::parse();
 
+    let taps = 257; // or 513 if you want sharper skirts
     let spreading_factor = args.spreading_factor;
     let chip_rate = args.chip_rate; // only used in encode/decode modes
     let carrier_freq = args.carrier_freq;
@@ -695,7 +981,7 @@ fn main() {
     };
 
     let encoder = DsssEncoder::new(config.clone());
-    let decoder = DsssDecoder::new(config);
+    let decoder = DsssDecoder::new(config.clone());
 
     //----------------------------------------------------------
     // MODE: ENCODE
@@ -756,21 +1042,31 @@ fn main() {
         println!("[decode] {} samples loaded…", samples.len());
 
         // Simple aligned decode:
-        let recovered = decoder.decode_from_passband(&samples);
-
-        println!("[decode] decoded {} bytes. Writing to {}",
-                 recovered.len(),
-                 args.output);
+        let recovered = decoder.decode_from_passband_with_preamble(&samples, taps);
 
         // Write decoded bytes to output file
-        let mut f = File::create(&args.output)
-        .expect("failed to create output file");
-        f.write_all(&recovered).expect("failed to write output message");
+	match recovered {
+	    Some(ref bytes) => {
+		println!(
+		    "[debug] recovered {} bytes, writing to {}",
+		    bytes.len(),
+		    args.output
+		);
 
-        println!(
-            "[decode] message recovered: {}",
-            String::from_utf8_lossy(&recovered)
-        );
+		let mut f = std::fs::File::create(&args.output)
+		    .expect("failed to create output file");
+		use std::io::Write;
+		f.write_all(&bytes).expect("failed to write output message");
+
+		println!(
+		    "[debug] as UTF-8 (lossy): {}",
+		    String::from_utf8_lossy(&bytes)
+		);
+	    }
+	    None => {
+		eprintln!("[debug] loopback failed: no valid frame recovered");
+	    }
+	}
 
         return;
     }
@@ -821,6 +1117,8 @@ fn main() {
             prn_code: prn,
         };
 
+	let decoder = DsssDecoder::new(config.clone());
+
         //--------------------------------------------------
         // 5. Load payload bytes
         //--------------------------------------------------
@@ -840,19 +1138,274 @@ fn main() {
         //--------------------------------------------------
         // 6. Build one DSSS frame (preamble + payload bits)
         //--------------------------------------------------
-        let payload_len = payload.len() as u32;
-        let mut frame_bytes = Vec::with_capacity(4 + payload.len());
-        frame_bytes.extend_from_slice(&payload_len.to_be_bytes());
-        frame_bytes.extend_from_slice(&payload);
+        let payload_len: usize = payload.len();
 
-        let mut frame_bits = Vec::with_capacity(
-            PREAMBLE_BITS.len() + frame_bytes.len() * 8
-        );
-        frame_bits.extend_from_slice(PREAMBLE_BITS);
-        frame_bits.extend(bytes_to_bits(&frame_bytes));
+	// 6.1. Build [len|payload] as RS data
+	if payload_len + 4 > RS_DATA_LEN {
+	    eprintln!(
+		"[embed] payload too long: {} bytes (max {} bytes, excluding length header)",
+		payload_len,
+		RS_DATA_LEN - 4
+	    );
+	    std::process::exit(1);
+	}
 
-        let frame_chips = bits_to_chips(&frame_bits, &config);
-        let frame = chips_to_passband(&frame_chips, &config);
+	let mut rs_data = vec![0u8; RS_DATA_LEN];
+
+	let len_u32: u32 = payload_len as u32;
+	rs_data[0..4].copy_from_slice(&len_u32.to_be_bytes());
+	rs_data[4..4 + payload_len].copy_from_slice(&payload);
+
+	// 6.2. RS-encode: rs_data -> rs_codeword (len = RS_CODEWORD_LEN)
+	let enc = Encoder::new(RS_ECC_LEN);
+	let encoded = enc.encode(&rs_data[..]); // Buffer
+	let rs_codeword: &[u8] = encoded.as_ref(); // [data|ecc], length 255
+
+	// DEBUG: dump the exact codeword we transmitted
+	std::fs::write("tx_codeword.bin", rs_codeword)
+	    .expect("failed to write tx_codeword.bin");
+	
+	// RS SELF-TEST (no DSSS at all)
+	{
+	    println!("[debug] RS self-test: data.len() = {}, codeword.len() = {}",
+		     rs_data.len(), rs_codeword.len());
+
+	    let mut cw = rs_codeword.to_vec();
+	    let dec = Decoder::new(RS_ECC_LEN);
+
+	    match dec.correct(&mut cw, None) {
+		Ok(recovered) => {
+		    let data_back = recovered.data();
+		    println!("[debug] RS self-test: recovered.data().len() = {}", data_back.len());
+
+		    if data_back == &rs_data[..] {
+			println!("[debug] RS self-test: SUCCESS (data matches)");
+		    } else {
+			println!("[debug] RS self-test: MISMATCH!");
+			println!("[debug] orig[0..32]:   {:02X?}", &rs_data[..32.min(rs_data.len())]);
+			println!("[debug] recov[0..32]: {:02X?}", &data_back[..32.min(data_back.len())]);
+		    }
+		}
+		Err(e) => {
+		    println!("[debug] RS self-test: FAILED with {:?}", e);
+		}
+	    }
+	}
+	
+	// 6.3. Build DSSS frame bits: PREAMBLE_BITS + bits(rs_codeword)
+	let mut frame_bits = Vec::with_capacity(PREAMBLE_BITS.len() + RS_CODEWORD_LEN * 8);
+	frame_bits.extend_from_slice(PREAMBLE_BITS);
+	frame_bits.extend(bytes_to_bits(rs_codeword));
+
+	// 6.4. As before: bits -> chips -> passband
+	let frame_chips = bits_to_chips(&frame_bits, &config);
+
+	// DEBUG 1: chips-only loopback (bypass carrier/audio entirely)
+	if false {
+	    println!("[debug] running DSSS chips-only self-test…");
+
+	    // preamble chips using the *same* config
+	    let pre_chips = preamble_chips(&config);
+
+	    println!(
+		"[debug] frame_chips.len()={}, pre_chips.len()={}",
+		frame_chips.len(),
+		pre_chips.len()
+	    );
+
+	    // Sanity: does the frame actually *start* with the preamble chips?
+	    let mut mismatch_at: Option<usize> = None;
+	    for i in 0..pre_chips.len() {
+		if (frame_chips[i] - pre_chips[i]).abs() > 1e-6 {
+		    mismatch_at = Some(i);
+		    break;
+		}
+	    }
+
+	    match mismatch_at {
+		Some(i) => {
+		    println!(
+			"[debug] preamble mismatch at chip {}: frame={} pre={}",
+			i, frame_chips[i], pre_chips[i]
+		    );
+		}
+		None => {
+		    println!("[debug] preamble chips match at the start of frame_chips");
+		}
+	    }
+
+	    // Now decode *just the payload chips* directly from chips
+	    let chips_per_bit = config.spreading_factor;
+	    let codeword_bits = RS_CODEWORD_LEN * 8;
+	    let payload_start = pre_chips.len();
+	    let payload_end = payload_start + codeword_bits * chips_per_bit;
+
+	    if payload_end > frame_chips.len() {
+		println!(
+		    "[debug] not enough chips in frame for full codeword: have {}, need {}",
+		    frame_chips.len(),
+		    payload_end
+		);
+	    } else {
+		let payload_chips = &frame_chips[payload_start..payload_end];
+
+		let raw_bytes = decoder.decode_from_chips(payload_chips);
+		println!(
+		    "[debug] chips-only first 32 bytes: {:02X?}",
+		    &raw_bytes[..32.min(raw_bytes.len())]
+		);
+	    }
+
+	    std::process::exit(0);
+	}
+
+	// DEBUG 2: chips-only DSSS+RS loopback (no carrier, no audio)
+	if false {
+	    println!("[debug] running chips-only DSSS+RS self-test…");
+
+	    let pre_chips = preamble_chips(&config);
+
+	    println!(
+		"[debug] frame_chips.len() = {}, pre_chips.len() = {}",
+		frame_chips.len(),
+		pre_chips.len()
+	    );
+
+	    // payload chips right after preamble
+	    let chips_per_bit = config.spreading_factor;
+	    let codeword_bits = RS_CODEWORD_LEN * 8;
+	    let payload_start = pre_chips.len();
+	    let payload_end   = payload_start + codeword_bits * chips_per_bit;
+
+	    if payload_end > frame_chips.len() {
+		println!(
+		    "[debug] not enough chips in frame for full codeword: have {}, need {}",
+		    frame_chips.len(),
+		    payload_end
+		);
+	    } else {
+		let payload_chips = &frame_chips[payload_start..payload_end];
+
+		// Direct despread → bytes
+		let raw_bytes = decoder.decode_from_chips(payload_chips);
+		println!(
+		    "[debug] chips-only first 32 bytes: {:02X?}",
+		    &raw_bytes[..32.min(raw_bytes.len())]
+		);
+
+		// RS decode on chips-only result
+		if raw_bytes.len() >= RS_CODEWORD_LEN {
+		    let mut cw = [0u8; RS_CODEWORD_LEN];
+		    cw.copy_from_slice(&raw_bytes[..RS_CODEWORD_LEN]);
+
+		    let dec = Decoder::new(RS_ECC_LEN);
+		    match dec.correct(&mut cw, None) {
+			Ok(recovered) => {
+			    let data = recovered.data();
+			    println!(
+				"[debug] chips-only RS decode data[0..32]: {:02X?}",
+				&data[..32.min(data.len())]
+			    );
+			}
+			Err(e) => {
+			    println!("[debug] chips-only RS decode failed: {:?}", e);
+			}
+		    }
+		} else {
+		    println!(
+			"[debug] chips-only raw_bytes too short: {} < {}",
+			raw_bytes.len(),
+			RS_CODEWORD_LEN
+		    );
+		}
+	    }
+
+	    std::process::exit(0);
+	}
+
+	let frame = chips_to_passband(&frame_chips, &config);
+	println!("[debug] passband frame has {} samples", frame.len());
+
+	// -------------------------------------------------------------
+	// DEBUG 3: full float loopback: frame -> decode_with_preamble
+	// -------------------------------------------------------------
+	if true {
+	    println!("[debug] running full-float DSSS+RS loopback (no WAV, no quantization)…");
+
+	    match decoder.decode_from_passband_with_preamble(&frame, taps) {
+		Some(bytes) => {
+		    println!(
+			"[debug] full-float loopback recovered {} bytes: {:?}",
+			bytes.len(),
+			String::from_utf8_lossy(&bytes)
+		    );
+		}
+		None => {
+		    println!("[debug] full-float loopback: no valid frame recovered");
+		}
+	    }
+
+	    std::process::exit(0);
+	}
+
+	let rt_chips = decoder.demodulate_to_chips_nco(&frame);
+	println!(
+	    "[debug] passband roundtrip: frame_chips.len()={}, rt_chips[0].len()={}",
+	    frame_chips.len(),
+	    rt_chips[0].len()
+	);
+
+	// Compare first few chips numerically
+	let n_show = frame_chips.len().min(rt_chips.len()).min(16);
+	for i in 0..n_show {
+	    println!(
+		"[debug] chip[{}]: orig={:.4} rt={:.4}",
+		i, frame_chips[i], rt_chips[0][i]
+	    );
+	}
+
+	// Compute normalized correlation between original and round-tripped chips
+	let mut num = 0.0f32;
+	let mut den1 = 0.0f32;
+	let mut den2 = 0.0f32;
+	for i in 0..n_show {
+	    let a = frame_chips[i];
+	    let b = rt_chips[0][i];
+	    num += a * b;
+	    den1 += a * a;
+	    den2 += b * b;
+	}
+
+	let corr = num / ((den1.sqrt() * den2.sqrt()).max(1e-9));
+	println!("[debug] partial chip correlation (first {}): {}", n_show, corr);
+	
+	// DEBUG: loopback test of DSSS+RS without audio channel
+	if false {
+	    println!("[debug] running DSSS loopback self-test…");
+
+	    // "Transmit" frame directly
+	    let tx = frame.clone();
+
+	    // "Receive" and decode directly
+	    let recovered = decoder.decode_from_passband_with_preamble(&tx, taps);
+	    let raw_bytes = decoder.decode_from_passband_no_preamble(&tx);
+	    println!("[debug] first 32 bytes (no preamble): {:02X?}", &raw_bytes[..32.min(raw_bytes.len())]);
+	    
+	    match recovered {
+		Some(bytes) => {
+		    println!(
+			"[debug] loopback recovered {} bytes: {:?}",
+			bytes.len(),
+			String::from_utf8_lossy(&bytes)
+		    );
+		}
+		None => {
+		    println!("[debug] loopback failed: no valid frame recovered");
+		}
+	    }
+
+	    std::process::exit(0);
+	}
 
         let audio_len = audio.len();
         let frame_len = frame.len();
@@ -865,9 +1418,10 @@ fn main() {
 
         if n_frames == 0 {
             println!(
-                "[embed] Warningaudio too short for a single DSSS frame ({} samples, need {}). No DSSS will be embedded.",
+                "[embed] Warning: audio too short for a single DSSS frame ({} samples, need {}). No DSSS will be embedded.",
                 audio_len, frame_len
             );
+	    std::process::exit(1);
         }
 
         // Build DSSS vector matching audio length, tiling as many whole frames as fit.
@@ -927,6 +1481,13 @@ fn main() {
             );
         }
 
+	let mut max_val = 0.0f32;
+	for [l, r] in &mixed {
+	    max_val = max_val.max(l.abs());
+	    max_val = max_val.max(r.abs());
+	}
+	println!("[debug] max mixed amplitude = {}", max_val);
+
         //--------------------------------------------------
         // 9. Write stereo WAV with embedded DSSS
         //--------------------------------------------------
@@ -942,7 +1503,7 @@ fn main() {
         // 1. Read stereo WAV and derive sample rate
         let (audio, wav_fs) = read_stereo_wav(&args.input);
         let wav_fs_f = wav_fs as f32;
-    
+
         // 2. Auto-chip-rate from Fs and samples_per_chip (same as EMBED)
         let spc = args.samples_per_chip.max(1) as f32;
         let chip_rate = wav_fs_f / spc;
@@ -973,7 +1534,7 @@ fn main() {
             prn_code: prn,
         };
     
-        let decoder = DsssDecoder::new(config);
+        let decoder = DsssDecoder::new(config.clone());
     
         // 5. Select one channel (NO folding to mono)
         let mono: Vec<f32> = match args.channel {
@@ -991,31 +1552,47 @@ fn main() {
             "[decode-wav] mono stream has {} samples",
             mono.len()
         );
-    
+
+	// Design bandpass filter based on carrier + chip rate
+	let bp = design_bandpass_fir(
+	    wav_fs as f32,
+	    config.carrier_freq,
+	    config.chip_rate, // make sure this is set consistently with EMBED
+	    taps,
+	);
+
+	println!(
+	    "[decode-wav] bandpass: fc={} Hz, chip_rate={} Hz, taps={}",
+	    config.carrier_freq, config.chip_rate, taps
+	);
+
+	//let filtered = apply_fir(&mono, &bp);
+	let filtered = mono;
+
+	let chips = decoder.demodulate_to_chips_nco(&filtered);
+	for i in 0..16 {
+	    println!("[debug] chip[{}] = {}", i, chips[0][i]);
+	}
+
         // 6. Run preamble-based sliding-window decode
-        match decoder.decode_from_passband_with_preamble(&mono) {
-            Some(bytes) => {
-                println!(
-                    "[decode-wav] recovered {} bytes, writing to {}",
-                    bytes.len(),
-                    args.output
-                );
-                std::fs::write(&args.output, &bytes)
-                    .expect("failed to write decoded payload");
-    
-                //println!(
-                    //"[decode-wav] as UTF-8 (lossy): {}",
-                    //String::from_utf8_lossy(&bytes)
-                //);
-            }
-            None => {
-                eprintln!("[decode-wav] failed: no preamble found or payload too short");
-            }
-        }
+	match decoder.decode_from_passband_with_preamble(&filtered, taps) {
+	    Some(bytes) => {
+		println!(
+		    "[decode-wav] recovered {} bytes, writing to {}",
+		    bytes.len(),
+		    args.output
+		);
+		std::fs::write(&args.output, &bytes)
+		    .expect("failed to write decoded payload");
+	    }
+	    None => {
+		eprintln!("[decode-wav] failed: no valid frame recovered (see RS / preamble logs above)");
+	    }
+	}
     
         return;
     }
     
     unreachable!("mode must be encode, decode, or embed");
 }
-    
+

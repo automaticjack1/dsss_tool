@@ -8,7 +8,8 @@
 export CHANNEL="${1:-left}"
 
 export CPS=32
-export CARRIER_HZ=10000
+export SAMPLES_PER_CHIP=8
+export CARRIER_HZ=11025
 export IN_FILE=Acompanyament_Tema_de_Lucil·la.wav
 #export IN_FILE=silence.wav
 
@@ -24,17 +25,17 @@ cargo run -- \
   --input $IN_FILE \
   --output stereo_with_dsss.wav \
   --payload payload.bin \
-  --dsss-dbfs -20 \
+  --dsss-dbfs -75 \
   --delay-fraction 0.25 \
   --seed "test-seed" \
   --spreading-factor $CPS \
-  --samples-per-chip 4 \
+  --samples-per-chip $SAMPLES_PER_CHIP \
   --carrier-freq $CARRIER_HZ \
   --visualize
 
-if [ $? -ne 0 ]; then
-	exit 1
-fi
+#if [ $? -ne 0 ]; then
+	#exit 1
+#fi
 
 echo
 
@@ -44,7 +45,7 @@ cargo run -- \
   --output decoded.bin \
   --seed "test-seed" \
   --spreading-factor $CPS \
-  --samples-per-chip 4 \
+  --samples-per-chip $SAMPLES_PER_CHIP \
   --carrier-freq $CARRIER_HZ \
   --channel $CHANNEL
 
